@@ -1,9 +1,10 @@
-import java.io.IOException;
+import java.io.*;
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import java.nio.channels.*;
-import java.util.Iterator;
-import java.util.Scanner;
-import java.util.Set;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.ConcurrentSkipListSet;
 
 public class SimpleRealtimeBroadcastingServer {
 
@@ -12,6 +13,62 @@ public class SimpleRealtimeBroadcastingServer {
     private Selector selector;
 
     private int portNumber = 11451;
+
+    private HashMap<SocketChannel, BufferPair> socketChannel2BufferPair;
+
+    private HashMap<SocketChannel, Date> lastHeartBeatTime;
+
+    private String filePath = "server_data.txt";
+
+    private ConcurrentSkipListSet<SocketChannel> historyDataSent;
+
+    private ConcurrentSkipListSet<SocketChannel> newHistoryDataSent;
+
+    private void closeAllSocketChannels() {
+        Set<SocketChannel> socketChannelSet = socketChannel2BufferPair.keySet();
+        Iterator<SocketChannel> iterator = socketChannelSet.iterator();
+        while (iterator.hasNext()) {
+            SocketChannel socketChannel = iterator.next();
+            this.closeASocketChannel(socketChannel);
+        }
+    }
+
+    private void closeTheServerSocketChannel() {
+        if (this.serverSocketChannel != null) {
+            try {
+                this.serverSocketChannel.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+                System.err.println("Failed to close the server socket channel: " + e.getMessage());
+            }
+        }
+    }
+
+    private void closeTheSelector() {
+        if (this.selector != null) {
+            try {
+                this.selector.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+                System.err.println("Failed to close the selector: " + e.getMessage());
+            }
+        }
+    }
+
+    private void closeASocketChannel(SocketChannel socketChannel) {
+        if (socketChannel != null) {
+            try {
+                socketChannel.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+                System.err.println("Cannot close the given socket channel: " + e.getMessage());
+                this.socketChannel2BufferPair.remove(socketChannel);
+                this.lastHeartBeatTime.remove(socketChannel);
+                this.historyDataSent.remove(socketChannel);
+                this.newHistoryDataSent.remove(socketChannel);
+            }
+        }
+    }
 
     public SimpleRealtimeBroadcastingServer() {
         // open socket channel
@@ -34,20 +91,22 @@ public class SimpleRealtimeBroadcastingServer {
                 this.portNumber = scanner.nextInt();
             }
         }
+        // set the server socket channel to the non-blocking mode
+        try {
+            this.serverSocketChannel.configureBlocking(true);
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.err.println("Failed to set the server socket channel to the non-blocking mode: " + e.getMessage());
+            this.closeTheServerSocketChannel();
+            System.exit(1);
+        }
         // open a selector
         try {
             this.selector = Selector.open();
         } catch (IOException e) {
             e.printStackTrace();
             System.err.println("Failed to open the selector: " + e.getMessage());
-            if (serverSocketChannel != null) {
-                try {
-                    serverSocketChannel.close();
-                } catch (IOException ee) {
-                    ee.printStackTrace();
-                    System.err.println("Failed to close the server socket channel: " + ee.getMessage());
-                }
-            }
+            this.closeTheServerSocketChannel();
             System.exit(1);
         }
         // register the server socket channel to the selector
@@ -56,26 +115,25 @@ public class SimpleRealtimeBroadcastingServer {
         } catch (ClosedChannelException e) {
             e.printStackTrace();
             System.err.println("The socket channel was closed unexpectedly: " + e.getMessage());
-            if (selector != null) {
-                try {
-                    selector.close();
-                } catch (IOException ee) {
-                    ee.printStackTrace();
-                    System.err.println("Failed to close the selector: " + ee.getMessage());
-                }
-            }
+            this.closeTheSelector();
             System.exit(1);
         }
+        // initialize the `socketChannel2BufferPair` and `lastHeartBeatTime` HashMap
+        this.lastHeartBeatTime = new HashMap<>();
+        this.socketChannel2BufferPair = new HashMap<>();
+        // initialize `historyDataSent` and `newHistoryDataSent` sets.
+        this.historyDataSent = new ConcurrentSkipListSet<>();
+        this.newHistoryDataSent = new ConcurrentSkipListSet<>();
     }
 
     public void launch() {
         // start data generator thread
-        Thread dataGeneratorThread = new Thread(new RandomDataGenerator(100));
+        Thread dataGeneratorThread = new Thread(new RandomDataGenerator(100, this.historyDataSent, this.newHistoryDataSent, this.socketChannel2BufferPair, this.lastHeartBeatTime));
         dataGeneratorThread.setDaemon(true);
         dataGeneratorThread.start();
         // start heart beat monitor thread
 
-        // start pushing data
+        // start pushing the history data
         while (true) {
             // select the socket which has the new event
             try {
@@ -83,10 +141,13 @@ public class SimpleRealtimeBroadcastingServer {
             } catch (IOException e) {
                 e.printStackTrace();
                 System.err.println("Cannot call select() method on the selector: " + e.getMessage());
+                this.closeTheServerSocketChannel();
+                this.closeTheSelector();
                 System.exit(1);
             } catch (ClosedSelectorException e) {
                 e.printStackTrace();
                 System.err.println("The selector was closed unexpectedly: " + e.getMessage());
+                this.closeTheServerSocketChannel();
                 System.exit(1);
             }
             // get selection keys
@@ -95,23 +156,331 @@ public class SimpleRealtimeBroadcastingServer {
             // iterate through the keys and process the tasks
             while (iterator.hasNext()) {
                 SelectionKey key = iterator.next();
-                iterator.remove();
                 if (key.isAcceptable()) {
-                    accept(key);
+                    this.accept(key);
+                } else if (key.isReadable()) {
+                    // perform read operation on the given socket
+                    if (this.read(key) == StatusCode.FAIL) {
+                        // close the socket if fail
+                        this.closeASocketChannel((SocketChannel) key.channel());
+                    }
+                    if (this.process(key) == StatusCode.FAIL) {
+                        // close the socket if fail
+                        this.closeASocketChannel((SocketChannel) key.channel());
+                    }
                 }
             }
         }
     }
 
+    private int sendHistoryData(int matchedLineNumber, SocketChannel socketChannel) {
+        // open the file in read mode
+        BufferedReader reader = null;
+        while (true) {
+            try {
+                reader = new BufferedReader(new FileReader(this.filePath));
+                break;
+            } catch (FileNotFoundException e) {
+                e.printStackTrace();
+                System.err.println("Cannot find the server data file in the given path. Please locate the data file manually: ");
+                Scanner scanner = new Scanner(System.in);
+                this.filePath = scanner.nextLine();
+            }
+        }
+        // send the history data to the client
+        try {
+            String currentLine = reader.readLine();
+            for (int currentLineNumber = 0; currentLine != null; currentLineNumber ++) {
+                if (currentLineNumber < matchedLineNumber)
+                    // skip the data which the client already has
+                    reader.readLine();
+                else {
+                    // prepare the msg header data
+                    int serverCommandID = CommandID.DATA_RESP;
+                    int serverTotalLength = FieldLength.HEADER + FieldLength.TIMESTAMP + FieldLength.DATA;
+                    // prepare the msg body data
+                    String[] parts = currentLine.split("::");
+                    String serverTimestamp = parts[0];
+                    int serverData = Integer.parseInt(parts[1]);
+                    // get the output buffer
+                    if (!socketChannel2BufferPair.containsKey(socketChannel)) {
+                        socketChannel2BufferPair.put(socketChannel, new BufferPair());
+                    }
+                    ByteBuffer outputBuffer = socketChannel2BufferPair.get(socketChannel).getOutputBuffer();
+                    if (outputBuffer == null) {
+                        System.err.println("Failed to allocate output buffer for the current socket channel. Please check the memory usage or restart your server.");
+                        reader.close();
+                        return StatusCode.FAIL;
+                    }
+                    // encapsulate the msg
+                    outputBuffer.putInt(serverCommandID);
+                    outputBuffer.putInt(serverTotalLength);
+                    outputBuffer.put(serverTimestamp.getBytes(StandardCharsets.US_ASCII));
+                    outputBuffer.putInt(serverData);
+                    // switch to read mode
+                    outputBuffer.flip();
+                    // send the data
+                    try {
+                        socketChannel.write(outputBuffer);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                        System.err.println("Failed to send the data on the current socket channel.");
+                        this.closeASocketChannel(socketChannel);
+                    }
+                    // switch to the write mode
+                    outputBuffer.compact();
+                    // read a new line
+                    reader.readLine();
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.err.println("An error occurred when attempting to read a line from the file.");
+            // close the BufferedReader
+            try {
+                reader.close();
+            } catch (IOException ex) {
+                ex.printStackTrace();
+                System.err.println("Cannot close the current BufferedReader.");
+            }
+
+            return StatusCode.FAIL;
+        }
+        // add the socket to the `newHistoryDataSent` set
+        this.newHistoryDataSent.add(socketChannel);
+        // close the BufferedReader
+        try {
+            reader.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.err.println("Cannot close the current BufferedReader.");
+        }
+
+        return StatusCode.SUCCESS;
+    }
+
+    private int process(SelectionKey key) {
+        // get the socket channel
+        SocketChannel socketChannel = (SocketChannel) key.channel();
+        // get the input buffer
+        // error detection
+        if (!this.socketChannel2BufferPair.containsKey(socketChannel))
+        {
+            // should never happen
+            System.err.println("The given socket channel does NOT have a corresponding BufferPair.");
+            this.socketChannel2BufferPair.put(socketChannel, new BufferPair());
+            return StatusCode.FAIL;
+        }
+        ByteBuffer inputBuffer;
+        // error detection
+        if ((inputBuffer = this.socketChannel2BufferPair.get(socketChannel).getInputBuffer()) == null ) {
+            // should never happen
+            System.err.println("The given socket cannot be allocated a input buffer. Check your memory usage or restart the server.");
+            return StatusCode.FAIL;
+        }
+        // get the data from socket channel
+        try {
+            socketChannel.read(inputBuffer);
+            // switch to the read mode
+            inputBuffer.flip();
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.err.println("Cannot read data from the current socket channel.");
+            return  StatusCode.FAIL;
+        }
+        // test whether the msg header is complete
+        if (inputBuffer.remaining() < FieldLength.HEADER) {
+            // switch back to the write mode
+            inputBuffer.compact();
+
+            return StatusCode.NOT_COMPLETE;
+        }
+        // parse the header
+        int clientTotalLength = inputBuffer.getInt();
+        int clientCommandID = inputBuffer.getInt();
+        // test whether the msg body is complete
+        int bodyLength = clientTotalLength - FieldLength.HEADER;
+        if (inputBuffer.remaining() < bodyLength) {
+            // put the msg header back to the `inputBuffer`
+            inputBuffer.position(inputBuffer.position() - FieldLength.HEADER);
+            // switch back to the read mode
+            inputBuffer.compact();
+
+            return StatusCode.NOT_COMPLETE;
+        }
+        // read the msg body into a byte array
+        byte[] body = new byte[bodyLength];
+        inputBuffer.get(body, 0, bodyLength);
+        // switch to the write mode
+        inputBuffer.compact();
+        // select the corresponding operation by `commandID`
+        switch (clientCommandID) {
+            case CommandID.DATA_REQ: {
+                // parse the msg body
+                // parse the timestamp field
+                byte[] timestampBytes = new byte[FieldLength.TIMESTAMP];
+                System.arraycopy(body, 0, timestampBytes, 0, FieldLength.TIMESTAMP);
+                String lastTimestamp = new String(timestampBytes, StandardCharsets.US_ASCII);
+                // parse the data field
+                byte[] dataBytes = new byte[FieldLength.DATA];
+                System.arraycopy(body, FieldLength.TIMESTAMP, dataBytes, 0, FieldLength.DATA);
+                int lastData = ByteBuffer.wrap(dataBytes).getInt();
+                // match the last client data with the server data
+                int matchedLineNumber;
+                if((matchedLineNumber = matchHistoryData(lastTimestamp, lastData)) < 0) {
+                    // match failed. Send all history data to the client
+                    if(this.sendHistoryData(0, socketChannel) == StatusCode.FAIL)
+                        return  StatusCode.FAIL;
+                } else {
+                    // match succeeded. Start from the next history data
+                    if (this.sendHistoryData(matchedLineNumber, socketChannel) == StatusCode.FAIL)
+                        return StatusCode.FAIL;
+                }
+                break;
+            }
+            case CommandID.HEART_BEAT: {
+                this.updateTheLastHeartBeatTime(socketChannel);
+                break;
+            }
+            default: {
+                // should never happen
+                return StatusCode.FAIL;
+            }
+        }
+
+        return StatusCode.SUCCESS;
+    }
+
+    private void updateTheLastHeartBeatTime(SocketChannel socketChannel) {
+        this.lastHeartBeatTime.put(socketChannel, new Date());
+    }
+
+    private int matchHistoryData(String clientTimestamp, int clientData) {
+        // open the file with FileReader until succeeded
+        BufferedReader reader;
+        while (true) {
+            try {
+                reader = new BufferedReader(new FileReader(this.filePath));
+                break;
+            } catch (IOException e) {
+                e.printStackTrace();
+                System.err.println("Cannot find the server data file in the given path. Please locate the data file manually: ");
+                Scanner scanner = new Scanner(System.in);
+                this.filePath = scanner.nextLine();
+            }
+        }
+        // iterate through the entire file line by line
+        try {
+            String line = reader.readLine();
+            int lineNumber = 0;
+            while (line != null) {
+                String[] parts = line.split("::");
+                String serverTimestamp = parts[0];
+                String serverDataString = parts[1];
+                int serverData = Integer.parseInt(serverDataString);
+                if (clientTimestamp.equals(serverTimestamp) && clientData == serverData)
+                {
+                    // close the BufferedReader
+                    try {
+                        reader.close();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                        System.err.println("Cannot close the current BufferedReader.");
+                    }
+                    return lineNumber;
+                }
+                else lineNumber ++;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            System.err.println("An error occurred when attempting to read a line from the data file.");
+            // close the BufferedReader
+            try {
+                reader.close();
+            } catch (IOException ex) {
+                ex.printStackTrace();
+                System.err.println("Cannot close the current BufferedReader.");
+            }
+
+            return StatusCode.FAIL;
+        }
+        // close the BufferedReader
+        try {
+            reader.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.err.println("Cannot close the current BufferedReader.");
+        }
+
+        return StatusCode.FAIL;
+    }
+
+    private int read(SelectionKey key) {
+        // get the socket channel from the selection key
+        SocketChannel socketChannel = (SocketChannel) key.channel();
+        // error detection
+        if (!this.socketChannel2BufferPair.containsKey(socketChannel))
+        {
+            // should never happen
+            System.err.println("The given socket channel does NOT have a corresponding BufferPair.");
+            this.socketChannel2BufferPair.put(socketChannel, new BufferPair());
+        }
+        ByteBuffer inputBuffer;
+        // error detection
+        if ((inputBuffer = this.socketChannel2BufferPair.get(socketChannel).getInputBuffer()) == null ) {
+            // should never happen
+            System.err.println("The given socket cannot be allocated a input buffer. Check your memory usage or restart the server.");
+            return StatusCode.FAIL;
+        }
+        // bulk read
+        try {
+            socketChannel.read(inputBuffer);
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.err.println("Cannot read the input buffer of the given socket channel.");
+        }
+        // switch the input buffer to the read mode
+        inputBuffer.flip();
+
+        return StatusCode.SUCCESS;
+    }
+
+    private ByteBuffer createAByteBuffer() {
+        int bufferSize = 1 << 10;
+        return ByteBuffer.allocate(bufferSize);
+    }
+
     private void accept(SelectionKey key) {
         ServerSocketChannel serverSocket = (ServerSocketChannel) key.channel();
+        SocketChannel socketChannel = null;
+        // accept the new connection
         try {
-            SocketChannel socketChannel = serverSocket.accept();
+            socketChannel = serverSocket.accept();
         } catch (IOException e) {
             e.printStackTrace();
             System.err.println("Failed to accept the new connection: " + e.getMessage());
-            System.exit(1);
+            return;
         }
+        // configure the new socket channel to the non-blocking mode
+        try {
+            socketChannel.configureBlocking(false);
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.err.println("Cannot set the socket channel to the non-blocking mode: " + e.getMessage());
+            this.closeASocketChannel(socketChannel);
+            return;
+        }
+        // register the socket channel to the server selector
+        try {
+            socketChannel.register(this.selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+        } catch (ClosedChannelException e) {
+            e.printStackTrace();
+            System.err.println("Cannot register the given socket channel to the server selector since the socket channel has been closed unexpectedly: " +e.getMessage());
+        }
+        // add the new socket channel to the hash map
+        this.socketChannel2BufferPair.put(socketChannel, new BufferPair());
+        // add the new socket channel to the `lastHeartBeatTime` hash map
+        this.lastHeartBeatTime.put(socketChannel, new Date());
     }
 
     public static void main(String args[]) {

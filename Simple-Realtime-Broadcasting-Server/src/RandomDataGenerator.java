@@ -1,9 +1,11 @@
 import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.Random;
-import java.util.Scanner;
+import java.util.*;
+import java.util.concurrent.ConcurrentSkipListSet;
 
 public class RandomDataGenerator implements Runnable {
 
@@ -32,7 +34,15 @@ public class RandomDataGenerator implements Runnable {
      */
     SimpleDateFormat dateFormatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
 
-    public RandomDataGenerator(int range) {
+    private ConcurrentSkipListSet<SocketChannel> historyDataSent;
+
+    private ConcurrentSkipListSet<SocketChannel> newHistoryDataSent;
+
+    private HashMap<SocketChannel, BufferPair> socketChannel2BufferPair;
+
+    private HashMap<SocketChannel, Date> lastHeartBeatTime;
+
+    public RandomDataGenerator(int range, ConcurrentSkipListSet<SocketChannel> historyDataSent, ConcurrentSkipListSet<SocketChannel> newHistoryDataSent, HashMap<SocketChannel, BufferPair> socketChannel2BufferPair, HashMap<SocketChannel, Date> lastHeartBeatTime) {
         this.range = range;
         this.randomIntegerGenerator = new Random();
         while (true) {
@@ -44,6 +54,25 @@ public class RandomDataGenerator implements Runnable {
                 System.out.println("Please assign another server data file to the server. Input the path below: ");
                 Scanner scanner = new Scanner(System.in);
                 filePath = scanner.nextLine();
+            }
+        }
+        this.historyDataSent = historyDataSent;
+        this.newHistoryDataSent = newHistoryDataSent;
+        this.socketChannel2BufferPair = socketChannel2BufferPair;
+        this.lastHeartBeatTime = lastHeartBeatTime;
+    }
+
+    private void closeASocketChannel(SocketChannel socketChannel) {
+        if (socketChannel != null) {
+            try {
+                socketChannel.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+                System.err.println("Cannot close the given socket channel: " + e.getMessage());
+                this.socketChannel2BufferPair.remove(socketChannel);
+                this.lastHeartBeatTime.remove(socketChannel);
+                this.historyDataSent.remove(socketChannel);
+                this.newHistoryDataSent.remove(socketChannel);
             }
         }
     }
@@ -74,6 +103,47 @@ public class RandomDataGenerator implements Runnable {
                         Scanner scanner = new Scanner(System.in);
                         filePath = scanner.nextLine();
                     }
+                }
+            }
+            // update `historyDataSent` with `newHistoryDataSent`
+            this.historyDataSent.clear();
+            this.historyDataSent.addAll(this.newHistoryDataSent);
+            // send real-time data
+            Iterator<SocketChannel> iterator = this.historyDataSent.iterator();
+            while (iterator.hasNext()) {
+                // get the socket channel
+                SocketChannel socketChannel = iterator.next();
+                // get the output buffer
+                if (!socketChannel2BufferPair.containsKey(socketChannel)) {
+                    socketChannel2BufferPair.put(socketChannel, new BufferPair());
+                }
+                ByteBuffer outputBuffer = socketChannel2BufferPair.get(socketChannel).getOutputBuffer();
+                if (outputBuffer == null) {
+                    System.err.println("Failed to allocate output buffer for the current socket channel. Please check the memory usage or restart your server.");
+                    // close the socket and free the resources
+                    this.closeASocketChannel(socketChannel);
+                }
+                // prepare the msg header
+                int commandID = CommandID.DATA_RESP;
+                int totalLength = FieldLength.HEADER + FieldLength.TIMESTAMP + FieldLength.DATA;
+                // prepare the msg body
+                String timestamp = "[" + formattedTime + "]";
+                // encapsulate the msg
+                outputBuffer.putInt(commandID);
+                outputBuffer.putInt(totalLength);
+                outputBuffer.put(timestamp.getBytes(StandardCharsets.US_ASCII));
+                outputBuffer.putInt(randomInteger);
+                // switch to the read mode
+                outputBuffer.flip();
+                try {
+                    // send the data
+                    socketChannel.write(outputBuffer);
+                    // switch to the write mode
+                    outputBuffer.compact();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                    System.err.println("Cannot write data to the current socket.");
+                    this.closeASocketChannel(socketChannel);
                 }
             }
             // sleep 250ms
