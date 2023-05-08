@@ -66,6 +66,7 @@ public class SimpleRealtimeBroadcastingServer {
                 this.lastHeartBeatTime.remove(socketChannel);
                 this.historyDataSent.remove(socketChannel);
                 this.newHistoryDataSent.remove(socketChannel);
+                this.lastHeartBeatTime.remove(socketChannel);
             }
         }
     }
@@ -340,6 +341,12 @@ public class SimpleRealtimeBroadcastingServer {
             }
             case CommandID.HEART_BEAT: {
                 this.updateTheLastHeartBeatTime(socketChannel);
+                try {
+                    System.out.println("[" + new Date() + "] " + "A heartbeat was received from " + socketChannel.getRemoteAddress());
+                } catch (IOException e) {
+                    e.printStackTrace();
+                    System.err.println("[" + new Date() + "] " + "A heartbeat was received but we cannot get the remote address.");
+                }
                 break;
             }
             default: {

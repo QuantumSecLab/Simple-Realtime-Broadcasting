@@ -73,6 +73,7 @@ public class RandomDataGenerator implements Runnable {
                 this.lastHeartBeatTime.remove(socketChannel);
                 this.historyDataSent.remove(socketChannel);
                 this.newHistoryDataSent.remove(socketChannel);
+                this.lastHeartBeatTime.remove(socketChannel);
             }
         }
     }
