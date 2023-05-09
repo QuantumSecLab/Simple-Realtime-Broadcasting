@@ -15,10 +15,12 @@ public class HeartBeatSender implements Runnable {
     public void run() {
         while (true) {
             ByteBuffer outputBuffer = ByteBuffer.allocate(1 << 10);
-            outputBuffer.putInt(CommandID.HEART_BEAT);
             outputBuffer.putInt(FieldLength.HEADER);
+            outputBuffer.putInt(CommandID.HEART_BEAT);
+            outputBuffer.flip();
             try {
                 this.socketChannel.write(outputBuffer);
+                outputBuffer.compact();
                 System.out.println("[" + new Date() + "] " + "A heartbeat was sent.");
             } catch (IOException e) {
                 e.printStackTrace();

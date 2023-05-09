@@ -4,7 +4,9 @@ import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.CopyOnWriteArraySet;
 
 public class SimpleRealtimeBroadcastingServer {
 
@@ -14,15 +16,15 @@ public class SimpleRealtimeBroadcastingServer {
 
     private int portNumber = 11451;
 
-    private HashMap<SocketChannel, BufferPair> socketChannel2BufferPair;
+    private ConcurrentHashMap<SocketChannel, BufferPair> socketChannel2BufferPair;
 
-    private HashMap<SocketChannel, Date> lastHeartBeatTime;
+    private ConcurrentHashMap<SocketChannel, Date> lastHeartBeatTime;
 
     private String filePath = "server_data.txt";
 
-    private ConcurrentSkipListSet<SocketChannel> historyDataSent;
+    private CopyOnWriteArraySet<SocketChannel> historyDataSent;
 
-    private ConcurrentSkipListSet<SocketChannel> newHistoryDataSent;
+    private CopyOnWriteArraySet<SocketChannel> newHistoryDataSent;
 
     private void closeAllSocketChannels() {
         Set<SocketChannel> socketChannelSet = socketChannel2BufferPair.keySet();
@@ -59,14 +61,14 @@ public class SimpleRealtimeBroadcastingServer {
         if (socketChannel != null) {
             try {
                 socketChannel.close();
-            } catch (IOException e) {
-                e.printStackTrace();
-                System.err.println("Cannot close the given socket channel: " + e.getMessage());
                 this.socketChannel2BufferPair.remove(socketChannel);
                 this.lastHeartBeatTime.remove(socketChannel);
                 this.historyDataSent.remove(socketChannel);
                 this.newHistoryDataSent.remove(socketChannel);
                 this.lastHeartBeatTime.remove(socketChannel);
+            } catch (IOException e) {
+                e.printStackTrace();
+                System.err.println("Cannot close the given socket channel: " + e.getMessage());
             }
         }
     }
@@ -94,7 +96,7 @@ public class SimpleRealtimeBroadcastingServer {
         }
         // set the server socket channel to the non-blocking mode
         try {
-            this.serverSocketChannel.configureBlocking(true);
+            this.serverSocketChannel.configureBlocking(false);
         } catch (IOException e) {
             e.printStackTrace();
             System.err.println("Failed to set the server socket channel to the non-blocking mode: " + e.getMessage());
@@ -119,12 +121,14 @@ public class SimpleRealtimeBroadcastingServer {
             this.closeTheSelector();
             System.exit(1);
         }
-        // initialize the `socketChannel2BufferPair` and `lastHeartBeatTime` HashMap
-        this.lastHeartBeatTime = new HashMap<>();
-        this.socketChannel2BufferPair = new HashMap<>();
+        // initialize the `socketChannel2BufferPair` and `lastHeartBeatTime` ConcurrentHashMap
+        this.lastHeartBeatTime = new ConcurrentHashMap<>();
+        this.socketChannel2BufferPair = new ConcurrentHashMap<>();
         // initialize `historyDataSent` and `newHistoryDataSent` sets.
-        this.historyDataSent = new ConcurrentSkipListSet<>();
-        this.newHistoryDataSent = new ConcurrentSkipListSet<>();
+        this.historyDataSent = new CopyOnWriteArraySet<>();
+        this.newHistoryDataSent = new CopyOnWriteArraySet<>();
+
+        System.out.println("The server started successfully on the port " + this.portNumber);
     }
 
     public void launch() {
@@ -133,7 +137,9 @@ public class SimpleRealtimeBroadcastingServer {
         dataGeneratorThread.setDaemon(true);
         dataGeneratorThread.start();
         // start heart beat monitor thread
-
+        Thread heartbeatMonitor = new Thread(new HeartBeatMonitor(this.lastHeartBeatTime, this.historyDataSent, this.newHistoryDataSent, this.socketChannel2BufferPair));
+        heartbeatMonitor.setDaemon(true);
+        heartbeatMonitor.start();
         // start pushing the history data
         while (true) {
             // select the socket which has the new event
@@ -157,6 +163,10 @@ public class SimpleRealtimeBroadcastingServer {
             // iterate through the keys and process the tasks
             while (iterator.hasNext()) {
                 SelectionKey key = iterator.next();
+                iterator.remove();
+                if (!key.isValid()) {
+                    continue;
+                }
                 if (key.isAcceptable()) {
                     this.accept(key);
                 } else if (key.isReadable()) {
@@ -174,7 +184,7 @@ public class SimpleRealtimeBroadcastingServer {
         }
     }
 
-    private int sendHistoryData(int matchedLineNumber, SocketChannel socketChannel) {
+    private int sendHistoryData(SocketChannel socketChannel) {
         // open the file in read mode
         BufferedReader reader = null;
         while (true) {
@@ -192,47 +202,42 @@ public class SimpleRealtimeBroadcastingServer {
         try {
             String currentLine = reader.readLine();
             for (int currentLineNumber = 0; currentLine != null; currentLineNumber ++) {
-                if (currentLineNumber < matchedLineNumber)
-                    // skip the data which the client already has
-                    reader.readLine();
-                else {
-                    // prepare the msg header data
-                    int serverCommandID = CommandID.DATA_RESP;
-                    int serverTotalLength = FieldLength.HEADER + FieldLength.TIMESTAMP + FieldLength.DATA;
-                    // prepare the msg body data
-                    String[] parts = currentLine.split("::");
-                    String serverTimestamp = parts[0];
-                    int serverData = Integer.parseInt(parts[1]);
-                    // get the output buffer
-                    if (!socketChannel2BufferPair.containsKey(socketChannel)) {
-                        socketChannel2BufferPair.put(socketChannel, new BufferPair());
-                    }
-                    ByteBuffer outputBuffer = socketChannel2BufferPair.get(socketChannel).getOutputBuffer();
-                    if (outputBuffer == null) {
-                        System.err.println("Failed to allocate output buffer for the current socket channel. Please check the memory usage or restart your server.");
-                        reader.close();
-                        return StatusCode.FAIL;
-                    }
-                    // encapsulate the msg
-                    outputBuffer.putInt(serverCommandID);
-                    outputBuffer.putInt(serverTotalLength);
-                    outputBuffer.put(serverTimestamp.getBytes(StandardCharsets.US_ASCII));
-                    outputBuffer.putInt(serverData);
-                    // switch to read mode
-                    outputBuffer.flip();
-                    // send the data
-                    try {
-                        socketChannel.write(outputBuffer);
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                        System.err.println("Failed to send the data on the current socket channel.");
-                        this.closeASocketChannel(socketChannel);
-                    }
-                    // switch to the write mode
-                    outputBuffer.compact();
-                    // read a new line
-                    reader.readLine();
+                // prepare the msg header data
+                int serverTotalLength = FieldLength.HEADER + FieldLength.TIMESTAMP + FieldLength.DATA;
+                int serverCommandID = CommandID.DATA_RESP;
+                // prepare the msg body data
+                String[] parts = currentLine.split("::");
+                String serverTimestamp = parts[0];
+                int serverData = Integer.parseInt(parts[1]);
+                // get the output buffer
+                if (!socketChannel2BufferPair.containsKey(socketChannel)) {
+                    socketChannel2BufferPair.put(socketChannel, new BufferPair());
                 }
+                ByteBuffer outputBuffer = socketChannel2BufferPair.get(socketChannel).getOutputBuffer();
+                if (outputBuffer == null) {
+                    System.err.println("Failed to allocate output buffer for the current socket channel. Please check the memory usage or restart your server.");
+                    reader.close();
+                    return StatusCode.FAIL;
+                }
+                // encapsulate the msg
+                outputBuffer.putInt(serverTotalLength);
+                outputBuffer.putInt(serverCommandID);
+                outputBuffer.put(serverTimestamp.getBytes(StandardCharsets.US_ASCII));
+                outputBuffer.putInt(serverData);
+                // switch to read mode
+                outputBuffer.flip();
+                // send the data
+                try {
+                    socketChannel.write(outputBuffer);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                    System.err.println("Failed to send the data on the current socket channel.");
+                    this.closeASocketChannel(socketChannel);
+                }
+                // switch to the write mode
+                outputBuffer.compact();
+                // read a new line
+                currentLine = reader.readLine();
             }
         } catch (IOException e) {
             e.printStackTrace();
@@ -279,16 +284,7 @@ public class SimpleRealtimeBroadcastingServer {
             System.err.println("The given socket cannot be allocated a input buffer. Check your memory usage or restart the server.");
             return StatusCode.FAIL;
         }
-        // get the data from socket channel
-        try {
-            socketChannel.read(inputBuffer);
-            // switch to the read mode
-            inputBuffer.flip();
-        } catch (IOException e) {
-            e.printStackTrace();
-            System.err.println("Cannot read data from the current socket channel.");
-            return  StatusCode.FAIL;
-        }
+
         // test whether the msg header is complete
         if (inputBuffer.remaining() < FieldLength.HEADER) {
             // switch back to the write mode
@@ -326,17 +322,10 @@ public class SimpleRealtimeBroadcastingServer {
                 byte[] dataBytes = new byte[FieldLength.DATA];
                 System.arraycopy(body, FieldLength.TIMESTAMP, dataBytes, 0, FieldLength.DATA);
                 int lastData = ByteBuffer.wrap(dataBytes).getInt();
-                // match the last client data with the server data
-                int matchedLineNumber;
-                if((matchedLineNumber = matchHistoryData(lastTimestamp, lastData)) < 0) {
-                    // match failed. Send all history data to the client
-                    if(this.sendHistoryData(0, socketChannel) == StatusCode.FAIL)
-                        return  StatusCode.FAIL;
-                } else {
-                    // match succeeded. Start from the next history data
-                    if (this.sendHistoryData(matchedLineNumber, socketChannel) == StatusCode.FAIL)
-                        return StatusCode.FAIL;
-                }
+                // send history data
+                if(this.sendHistoryData(socketChannel) == StatusCode.FAIL)
+                    return StatusCode.FAIL;
+
                 break;
             }
             case CommandID.HEART_BEAT: {

@@ -96,13 +96,6 @@ public class SimpleRealtimeBroadcastingClient {
     }
 
     void sendDataReq() {
-        // sending data req confirmation
-        Scanner scanner = new Scanner(System.in);
-        while (true) {
-            System.out.println("Do you want to send a data request right now? (y/n)");
-            if ((scanner.nextLine()).equals("y"))
-                break;
-        }
         // find the last record
         BufferedReader reader = null;
         while (true) {
@@ -112,6 +105,7 @@ public class SimpleRealtimeBroadcastingClient {
             } catch (FileNotFoundException e) {
                 e.printStackTrace();
                 System.err.println("Cannot find the client data file. Please assign the location manually: " + e.getMessage());
+                Scanner scanner = new Scanner(System.in);
                 this.filePath = scanner.nextLine();
             }
         }
@@ -137,8 +131,8 @@ public class SimpleRealtimeBroadcastingClient {
             String timestamp = parts[0];
             int data = Integer.parseInt(parts[1]);
             // encapsulate the msg
-            this.outputBuffer.putInt(CommandID.DATA_REQ);
             this.outputBuffer.putInt(FieldLength.HEADER + FieldLength.TIMESTAMP + FieldLength.DATA);
+            this.outputBuffer.putInt(CommandID.DATA_REQ);
             this.outputBuffer.put(timestamp.getBytes(StandardCharsets.US_ASCII));
             this.outputBuffer.putInt(data);
             // switch to the read mode
@@ -149,8 +143,8 @@ public class SimpleRealtimeBroadcastingClient {
             byte[] data = new byte[FieldLength.DATA];
             Arrays.fill(data, 0, FieldLength.DATA, (byte) 0);
             // encapsulate the msg
-            this.outputBuffer.putInt(CommandID.DATA_REQ);
             this.outputBuffer.putInt(FieldLength.HEADER + FieldLength.TIMESTAMP + FieldLength.DATA);
+            this.outputBuffer.putInt(CommandID.DATA_REQ);
             this.outputBuffer.put(timestamp);
             this.outputBuffer.put(data);
             // switch to the read mode
@@ -173,7 +167,7 @@ public class SimpleRealtimeBroadcastingClient {
         // create a heartbeat sender thread
         Thread heartbeatSender = new Thread(new HeartBeatSender(this.socketChannel));
         heartbeatSender.setDaemon(true);
-        heartbeatSender.start();
+        // heartbeatSender.start();
         // send the data req confirmation
         this.sendDataReq();
         // process received data
@@ -196,6 +190,7 @@ public class SimpleRealtimeBroadcastingClient {
                 }
             }
         }
+
     }
 
     private void process(SelectionKey key) {
@@ -222,8 +217,8 @@ public class SimpleRealtimeBroadcastingClient {
                 return;
             }
             // parse the header
-            int commandID = inputBuffer.getInt();
             int totalLength = inputBuffer.getInt();
+            int commandID = inputBuffer.getInt();
             // test whether the msg body is complete
             if (inputBuffer.remaining() < totalLength) {
                 // put the header back to the buffer
@@ -250,7 +245,8 @@ public class SimpleRealtimeBroadcastingClient {
                     // write to the file
                     while (true) {
                         try {
-                            this.fileWriter.write(timestamp + "::" + data);
+                            this.fileWriter.write(timestamp + "::" + data + "\n");
+                            System.out.println(timestamp + "::" + data);
                             this.fileWriter.flush();
                             break;
                         } catch (IOException e) {

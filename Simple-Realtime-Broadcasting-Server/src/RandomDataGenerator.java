@@ -5,7 +5,8 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.*;
-import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
 
 public class RandomDataGenerator implements Runnable {
 
@@ -34,15 +35,15 @@ public class RandomDataGenerator implements Runnable {
      */
     SimpleDateFormat dateFormatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
 
-    private ConcurrentSkipListSet<SocketChannel> historyDataSent;
+    private CopyOnWriteArraySet<SocketChannel> historyDataSent;
 
-    private ConcurrentSkipListSet<SocketChannel> newHistoryDataSent;
+    private CopyOnWriteArraySet<SocketChannel> newHistoryDataSent;
 
-    private HashMap<SocketChannel, BufferPair> socketChannel2BufferPair;
+    private ConcurrentHashMap<SocketChannel, BufferPair> socketChannel2BufferPair;
 
-    private HashMap<SocketChannel, Date> lastHeartBeatTime;
+    private ConcurrentHashMap<SocketChannel, Date> lastHeartBeatTime;
 
-    public RandomDataGenerator(int range, ConcurrentSkipListSet<SocketChannel> historyDataSent, ConcurrentSkipListSet<SocketChannel> newHistoryDataSent, HashMap<SocketChannel, BufferPair> socketChannel2BufferPair, HashMap<SocketChannel, Date> lastHeartBeatTime) {
+    public RandomDataGenerator(int range, CopyOnWriteArraySet<SocketChannel> historyDataSent, CopyOnWriteArraySet<SocketChannel> newHistoryDataSent, ConcurrentHashMap<SocketChannel, BufferPair> socketChannel2BufferPair, ConcurrentHashMap<SocketChannel, Date> lastHeartBeatTime) {
         this.range = range;
         this.randomIntegerGenerator = new Random();
         while (true) {
@@ -66,14 +67,14 @@ public class RandomDataGenerator implements Runnable {
         if (socketChannel != null) {
             try {
                 socketChannel.close();
-            } catch (IOException e) {
-                e.printStackTrace();
-                System.err.println("Cannot close the given socket channel: " + e.getMessage());
                 this.socketChannel2BufferPair.remove(socketChannel);
                 this.lastHeartBeatTime.remove(socketChannel);
                 this.historyDataSent.remove(socketChannel);
                 this.newHistoryDataSent.remove(socketChannel);
                 this.lastHeartBeatTime.remove(socketChannel);
+            } catch (IOException e) {
+                e.printStackTrace();
+                System.err.println("Cannot close the given socket channel: " + e.getMessage());
             }
         }
     }
@@ -130,8 +131,8 @@ public class RandomDataGenerator implements Runnable {
                 // prepare the msg body
                 String timestamp = "[" + formattedTime + "]";
                 // encapsulate the msg
-                outputBuffer.putInt(commandID);
                 outputBuffer.putInt(totalLength);
+                outputBuffer.putInt(commandID);
                 outputBuffer.put(timestamp.getBytes(StandardCharsets.US_ASCII));
                 outputBuffer.putInt(randomInteger);
                 // switch to the read mode
