@@ -167,7 +167,7 @@ public class SimpleRealtimeBroadcastingClient {
         // create a heartbeat sender thread
         Thread heartbeatSender = new Thread(new HeartBeatSender(this.socketChannel));
         heartbeatSender.setDaemon(true);
-        // heartbeatSender.start();
+        heartbeatSender.start();
         // send the data req confirmation
         this.sendDataReq();
         // process received data
